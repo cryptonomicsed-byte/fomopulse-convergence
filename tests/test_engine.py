@@ -156,6 +156,144 @@ def test_unknown_wallet_has_a_floor_not_zero():
     assert 0 < w < 0.5, f"unknown weight should be a small floor, got {w}"
 
 
+# ── the conviction ceiling (safety-critical) ─────────────────────────────────
+
+
+def test_pushed_conviction_never_reaches_the_auto_execute_line():
+    """Vantage auto-creates a REAL order above 0.7 conviction. A 0-100 research
+    score must never map across that line by accident."""
+    from fpconv.bridges import VantageBridge
+
+    vb = VantageBridge(tool_key="x")
+    assert vb.MAX_PUSH_CONVICTION < vb.AUTO_EXECUTE_THRESHOLD
+    for score in (0, 19, 35, 55, 64.5, 69.5, 100):
+        c = vb.conviction_for(score)
+        assert c <= VantageBridge.MAX_PUSH_CONVICTION, f"score {score} → {c} crossed the line"
+        assert c < vb.AUTO_EXECUTE_THRESHOLD, f"score {score} → {c} is at/over 0.7"
+
+
+def test_perfect_score_maps_to_the_ceiling_not_beyond_it():
+    from fpconv.bridges import VantageBridge
+
+    vb = VantageBridge(tool_key="x")
+    assert vb.conviction_for(100) == vb.MAX_PUSH_CONVICTION
+    assert vb.conviction_for(1000) == vb.MAX_PUSH_CONVICTION, "clamped, not extrapolated"
+    assert vb.conviction_for(-50) == 0.0
+
+
+def test_auto_execute_requires_an_explicit_opt_in():
+    from fpconv.bridges import VantageBridge
+
+    assert VantageBridge(tool_key="x").conviction_for(100) < 0.7
+    armed = VantageBridge(tool_key="x", allow_auto_execute=True)
+    assert armed.conviction_for(100) == 1.0
+    assert armed.conviction_for(90) > 0.7, "armed means armed, and it is named as such"
+
+
+def test_conviction_is_always_within_vantage_contract():
+    """Vantage hard-rejects anything outside 0..1."""
+    from fpconv.bridges import VantageBridge
+
+    for armed in (False, True):
+        vb = VantageBridge(tool_key="x", allow_auto_execute=armed)
+        for score in (-1, 0, 50, 100, 999):
+            assert 0.0 <= vb.conviction_for(score) <= 1.0
+
+
+def test_push_body_carries_the_mint_so_downstream_can_resolve_it():
+    from fpconv.bridges import VantageBridge
+
+    class _S:
+        token = "0xabc123def456"
+        symbol = "TEST"
+        score = 60.0
+        actionable = True
+        reasons = ["r1", "r2"]
+        evidence = {"net_buy_usd": 1234.0}
+
+    body = VantageBridge(tool_key="x")._body(_S())
+    assert body["mint"] == "0xabc123def456", "a ticker alone is not tradeable downstream"
+    assert body["direction"] == "long"
+    assert body["source"] == "fpconv"
+    assert set(["symbol", "source", "type", "conviction"]) <= set(body)
+
+
+def test_net_selling_convergence_is_not_a_long():
+    from fpconv.bridges import VantageBridge
+
+    class _S:
+        token = "0x1"
+        symbol = "SELL"
+        score = 50.0
+        actionable = True
+        reasons = []
+        evidence = {"net_buy_usd": -5000.0}
+
+    assert VantageBridge(tool_key="x")._body(_S())["direction"] == "short"
+
+
+# ── TLS interception detection ───────────────────────────────────────────────
+# Offline assertions on the classification logic. The live check is `fpconv tls`.
+
+
+def test_interception_markers_cover_the_appliance_actually_seen():
+    """A FortiGate re-signed both pipeline hosts on 2026-09-21. It must be
+    recognised by name, not just by 'verification failed'."""
+    from fpconv import tlscheck
+
+    seen = (
+        "1.2.840.113549.1.9.1=support@fortinet.com,CN=FGT70FTK23012743,"
+        "OU=Certificate Authority,O=Fortinet,L=Sunnyvale,ST=California,C=US"
+    ).lower()
+    assert any(m in seen for m in tlscheck.INTERCEPTION_MARKERS)
+
+
+def test_real_public_ca_is_not_flagged_as_an_interceptor():
+    from fpconv import tlscheck
+
+    for issuer in (
+        "CN=Sectigo Public Server Authentication CA DV E36,O=Sectigo Limited,C=GB",
+        "CN=WE1,O=Google Trust Services,C=US",
+        "CN=GlobalSign Atlas R3 DV TLS CA 2025 Q4,O=GlobalSign nv-sa,C=BE",
+        "CN=R11,O=Let's Encrypt,C=US",
+    ):
+        low = issuer.lower()
+        assert not any(m in low for m in tlscheck.INTERCEPTION_MARKERS), issuer
+
+
+def test_a_verified_connection_is_never_reported_unsafe():
+    """Even a trusted re-signer would be unsafe: a re-signed link is not
+    end-to-end, whatever the device trusts."""
+    from fpconv.tlscheck import TlsVerdict
+
+    assert TlsVerdict("h", verified=True).safe
+    assert not TlsVerdict("h", verified=True, intercepted=True).safe, (
+        "interception makes a connection unusable regardless of trust"
+    )
+    assert not TlsVerdict("h", verified=False).safe
+
+
+def test_there_is_no_flag_to_disable_verification():
+    """The engine must not offer a bypass. Checked against the CLI surface so a
+    well-meaning later change cannot quietly add one."""
+    from fpconv.cli import build_parser
+
+    p = build_parser()
+    flags: list[str] = []
+    for a in p._actions:
+        flags += list(a.option_strings)
+        choices = getattr(a, "choices", None)
+        for sub in (choices.values() if isinstance(choices, dict) else []):
+            for sa in getattr(sub, "_actions", []) or []:
+                flags += list(sa.option_strings)
+    bad = [
+        f for f in flags
+        if any(k in f.lower() for k in ("insecure", "no-verify", "noverify", "trust-ca", "verify-off"))
+    ]
+    assert not bad, f"a verification bypass appeared: {bad}"
+    assert "--insecure" not in flags
+
+
 # ── end to end on a synthetic fill set ───────────────────────────────────────
 
 

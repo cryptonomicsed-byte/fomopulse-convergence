@@ -208,3 +208,25 @@ tests/test_engine.py   21 tests, no network
 incomplete, instead of the signals quietly going stale.
 
 Àṣẹ.
+
+## TLS interception — reported, never bypassed
+
+`fpconv tls` inspects every endpoint the engine depends on. On 2026-09-21 this
+network was found re-signing two of them:
+
+```
+tape      fomopulse.app          NOT END-TO-END   issuer CN=FGT70FTK23012743, O=Fortinet
+vantage   omokoda.duckdns.org    NOT END-TO-END   same appliance
+extra     github.com             END-TO-END       Sectigo
+extra     pypi.org               END-TO-END       GlobalSign
+extra     cloudflare.com         END-TO-END       Google Trust Services
+```
+
+The obvious "fix" is to disable verification or install the appliance's CA.
+**Both are refused here.** The first accepts a MITM on a link carrying an API
+key and trading signals; the second legitimises interception for every host on
+the device. There is no `--insecure` flag and a test asserts none can be added
+quietly.
+
+Signals still scan and store locally — only transmission is refused. That is
+the reason the local store is written before any push.

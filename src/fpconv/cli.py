@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -161,9 +162,21 @@ def cmd_paper(args) -> int:
     if rep.get("available"):
         print(f"  tables       {', '.join(rep.get('tables', []))}")
         print(f"  sidecar      {'present' if rep.get('has_sidecar') else 'will be created'}")
-    vb = VantageBridge(args.vantage, agent_key=args.agent_key)
+    vb = VantageBridge(
+        args.vantage,
+        tool_key=args.tool_key,
+        allow_auto_execute=args.allow_auto_execute,
+    )
     probe = vb.probe()
-    print(f"vantage        {'UP' if probe.get('up') else 'DOWN'} {probe}")
+    print(
+        f"vantage        {'UP' if probe.get('up') else 'DOWN'}  "
+        f"ingest={probe.get('ingest_status')} {probe.get('ingest', '')}"
+    )
+    print(
+        f"conviction     ceiling {probe.get('conviction_ceiling')} "
+        f"(Vantage auto-orders above {VantageBridge.AUTO_EXECUTE_THRESHOLD})"
+        f"{'  ⚠ AUTO-EXECUTE ARMED' if probe.get('auto_execute_armed') else ''}"
+    )
 
     if not args.from_store:
         print("\n(nothing emitted — pass --from-store to emit the latest stored signals)")
@@ -257,6 +270,56 @@ def cmd_verify(args) -> int:
     )
 
 
+def cmd_tls(args) -> int:
+    """Inspect every endpoint the engine depends on, without trusting any of them.
+
+    Deliberately not a 'fix' command: there is no flag here to disable
+    verification or to trust an interceptor. The only honest outputs are
+    "end-to-end" and "not end-to-end", and a pipeline carrying a tool key and
+    trading signals should refuse to run on the latter.
+    """
+    from .tlscheck import inspect
+
+    targets = [
+        ("tape", args.base),
+        ("vantage", args.vantage),
+    ]
+    if args.also:
+        targets += [("extra", u.strip()) for u in args.also.split(",") if u.strip()]
+
+    print("─" * 76)
+    unsafe = 0
+    for label, url in targets:
+        host = url.split("://", 1)[-1].split("/")[0].split(":")[0]
+        v = inspect(host)
+        state = "END-TO-END" if v.safe else "NOT END-TO-END"
+        if not v.safe:
+            unsafe += 1
+        print(f"{label:<9} {host:<28} {state}")
+        print(f"          verified={v.verified}  intercepted={v.intercepted}")
+        if v.cert:
+            print(f"          issuer  : {v.cert.issuer[:100]}")
+            print(f"          validity: {v.cert.not_after[:19]}")
+        if v.reason:
+            print(f"          {v.reason}")
+        if v.interceptor:
+            print(f"          INTERCEPTOR: {v.interceptor}")
+        print()
+
+    print("─" * 76)
+    if unsafe:
+        print(f"{unsafe} endpoint(s) NOT end-to-end.")
+        print()
+        print("This is reported, not bypassed. Verification is left ON and no")
+        print("interceptor CA is installed — accepting a re-signed link on a")
+        print("pipeline that carries an API key and trading signals is worse than")
+        print("failing. Signals still scan and store locally; only transmission")
+        print("is refused.")
+        return 1
+    print("all endpoints end-to-end.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="fpconv", description="fomopulse convergence & anomaly engine")
     p.add_argument("--base", default="https://fomopulse.app", help="tape base URL")
@@ -293,7 +356,19 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--paper-db", default=str(PaperTraderBridge().path))
     pp.add_argument("--paper-usd", type=float, default=100.0)
     pp.add_argument("--vantage", default="https://omokoda.duckdns.org")
-    pp.add_argument("--agent-key", default=None)
+    pp.add_argument(
+        "--tool-key",
+        default=os.environ.get("VANTAGE_TOOL_INTEL", ""),
+        help="X-Vantage-Tool-Key for the intel ingest (or env VANTAGE_TOOL_INTEL)",
+    )
+    pp.add_argument(
+        "--allow-auto-execute",
+        action="store_true",
+        help=(
+            "DANGEROUS: let conviction reach 1.0. Vantage auto-creates a REAL "
+            "order above 0.7. Off by default; research signals stay under it."
+        ),
+    )
     pp.add_argument("--from-store", action="store_true")
     pp.add_argument("--execute", action="store_true")
     pp.add_argument("--push-vantage", action="store_true")
@@ -317,6 +392,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="refuse to fall back to the tape checking itself",
     )
     v.set_defaults(func=cmd_verify)
+
+    t = sub.add_parser("tls", help="inspect endpoints for TLS interception")
+    t.add_argument("--vantage", default="https://omokoda.duckdns.org")
+    t.add_argument("--also", default="", help="extra host URLs, comma-separated")
+    t.set_defaults(func=cmd_tls)
 
     return p
 

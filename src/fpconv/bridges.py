@@ -195,22 +195,97 @@ class PaperTraderBridge:
 
 
 class VantageBridge:
-    """Pushes signals toward Vantage. Read-only; never mutates Vantage state
-    beyond publishing a signal row, which is what the feed is for."""
+    """Pushes signals into Vantage's existing intel ingest.
 
-    def __init__(self, base: str = DEFAULT_VANTAGE, agent_key: str | None = None, timeout: int = 20):
+    The endpoint is `POST /api/intel/signals/ingest`, authed as a *system tool*
+    (`X-Vantage-Tool: intel` + `X-Vantage-Tool-Key`), not as an agent. Its
+    contract is {symbol, source, type, conviction, direction, detail, mint}.
+
+    ## The conviction ceiling matters more than anything else here
+
+    `backend/routers/trading.py` states it plainly:
+
+        "Conviction is a 0-1 confidence, and >0.7 auto-creates a real order."
+
+    and `config.py` carries `PUMPFUN_SCAN_CONVICTION = 0.72  # >0.7 -> auto-order`.
+
+    This engine is research. Its score is 0-100. Pushed raw it would be rejected
+    by `_validated_conviction` for exceeding 1.0 — but pushed *divided by 100*
+    it would clear 0.7 on every strong signal and **auto-create real orders on
+    the strength of a convergence heuristic**. So the mapping is clamped below
+    the execution line by construction, and crossing it requires an explicit,
+    separately-named opt-in that defaults off.
+
+    `mint` is sent as the real contract address. A ticker is not resolvable
+    downstream, so a signal without an address cannot be traded on — which is
+    the correct outcome for most of what this engine finds.
+    """
+
+    # The auto-execution line lives in Vantage at >0.7. Stay strictly under it.
+    AUTO_EXECUTE_THRESHOLD = 0.7
+    MAX_PUSH_CONVICTION = 0.69
+
+    def __init__(
+        self,
+        base: str = DEFAULT_VANTAGE,
+        tool_key: str | None = None,
+        tool: str = "intel",
+        timeout: int = 20,
+        allow_auto_execute: bool = False,
+    ):
         self.base = base.rstrip("/")
-        self.agent_key = agent_key
+        self.tool = tool
+        self.tool_key = tool_key
         self.timeout = timeout
+        self.allow_auto_execute = allow_auto_execute
+
+    # ── conviction ───────────────────────────────────────────────────────
+
+    def conviction_for(self, score: float) -> float:
+        """Map the engine's 0-100 score onto Vantage's 0-1 conviction, clamped.
+
+        Default ceiling is 0.69 — under the auto-order line. With
+        `allow_auto_execute` the score maps to 0..1 unabridged, which is a
+        deliberate, explicit decision to let strong signals place orders.
+        """
+        s = max(0.0, min(100.0, float(score)))
+        ceiling = 1.0 if self.allow_auto_execute else self.MAX_PUSH_CONVICTION
+        return round((s / 100.0) * ceiling, 4)
+
+    def _body(self, s) -> dict:
+        ev = getattr(s, "evidence", {}) or {}
+        conv = self.conviction_for(getattr(s, "score", 0.0))
+        # Direction: net flow over the window decides it. A convergence with net
+        # selling is not a long, whatever the buyer count says.
+        net = float(ev.get("net_buy_usd") or 0.0)
+        direction = "long" if net > 0 else ("short" if net < 0 else "flat")
+        return {
+            "symbol": (getattr(s, "symbol", "") or getattr(s, "token", "")[:12])[:12],
+            "source": "fpconv",
+            "type": "convergence",
+            "conviction": conv,
+            "direction": direction,
+            # The mint is the contract address — without it nothing downstream
+            # can trade this, which is the right default for a research signal.
+            "mint": getattr(s, "token", ""),
+            "detail": " | ".join((getattr(s, "reasons", None) or [])[:4])[:900],
+        }
+
+    # ── transport ────────────────────────────────────────────────────────
 
     def _post(self, path: str, body: dict) -> tuple[int, str]:
+        headers = {
+            "Content-Type": "application/json",
+            f"X-Vantage-Tool": self.tool,
+        }
+        # Header name with the exact casing httpx/fastapi normalise to.
+        headers.pop("X-Vantage-Tool", None)
+        headers["X-Vantage-Tool"] = self.tool
+        headers["X-Vantage-Tool-Key"] = self.tool_key or ""
         req = urllib.request.Request(
             f"{self.base}{path}",
             data=json.dumps(body).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "x-agent-key": self.agent_key or "",
-            },
+            headers=headers,
             method="POST",
         )
         try:
@@ -222,23 +297,71 @@ class VantageBridge:
             return 0, str(e)[:400]
 
     def probe(self) -> dict:
-        """Is Vantage up, and does it answer? Reported rather than assumed —
-        the push is best-effort and the local store is the durable copy."""
+        """Is Vantage up, and is the intel tool configured?
+
+        503 means the endpoint is live but `VANTAGE_TOOL_INTEL` is unset, so no
+        signal can be ingested. That is reported rather than discovered later,
+        and it is why the local store is written first on every path.
+        """
+        out: dict = {}
         try:
             with urllib.request.urlopen(f"{self.base}/api/health", timeout=self.timeout) as r:
-                return {"up": True, "status": r.status}
+                out["up"] = True
+                out["status"] = r.status
         except urllib.error.HTTPError as e:
-            return {"up": True, "status": e.code, "note": "reachable, non-200"}
+            out["up"] = True
+            out["status"] = e.code
         except Exception as e:  # noqa: BLE001
             return {"up": False, "error": str(e)[:200]}
+
+        status, body = self._post(
+            "/api/intel/signals/ingest",
+            {
+                "symbol": "__fpconv_probe__",
+                "source": "fpconv",
+                "type": "probe",
+                "conviction": 0.0,
+                "direction": "flat",
+                "detail": "capability probe — safe to ignore",
+                "mint": "",
+            },
+        )
+        out["ingest_status"] = status
+        if status == 503:
+            out["ingest"] = "NOT CONFIGURED — set VANTAGE_TOOL_INTEL on the Vantage host"
+        elif status == 401:
+            out["ingest"] = "tool key rejected — check VANTAGE_TOOL_INTEL matches"
+        elif status in (200, 201):
+            out["ingest"] = "ready"
+        else:
+            out["ingest"] = f"unexpected: {body[:160]}"
+        out["conviction_ceiling"] = (
+            1.0 if self.allow_auto_execute else self.MAX_PUSH_CONVICTION
+        )
+        out["auto_execute_armed"] = bool(self.allow_auto_execute)
+        return out
 
     def push(self, signals: list, now: int | None = None, limit: int = 20) -> dict:
         now = int(now or time.time())
         results = []
         for s in signals[:limit]:
-            payload = s.to_dict()
-            payload["source"] = "fpconv"
-            payload["emitted_at"] = now
-            status, body = self._post("/api/intel/signal", payload)
-            results.append({"token": s.token, "status": status, "body": body})
-        return {"pushed": len(results), "results": results}
+            if not getattr(s, "actionable", False):
+                continue
+            status, body = self._post("/api/intel/signals/ingest", self._body(s))
+            results.append(
+                {
+                    "token": getattr(s, "token", ""),
+                    "conviction": self.conviction_for(getattr(s, "score", 0.0)),
+                    "status": status,
+                    "body": body,
+                }
+            )
+        ok = sum(1 for r in results if r["status"] in (200, 201))
+        return {
+            "attempted": len(results),
+            "accepted": ok,
+            "ceiling": (
+                1.0 if self.allow_auto_execute else self.MAX_PUSH_CONVICTION
+            ),
+            "results": results,
+        }
