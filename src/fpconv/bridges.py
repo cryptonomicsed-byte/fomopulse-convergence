@@ -20,6 +20,7 @@ Vantage
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 import urllib.error
@@ -28,6 +29,15 @@ from pathlib import Path
 
 DEFAULT_PAPER_DB = Path.home() / "ares_papertrade" / "trades.db"
 DEFAULT_VANTAGE = "https://omokoda.duckdns.org"
+
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _ulid(ts_s: int) -> str:
+    """26-char ULID: 48-bit ms time + 80 random bits (signal_record/1 id)."""
+    import secrets
+    n = (int(ts_s) * 1000 << 80) | secrets.randbits(80)
+    return "".join(_CROCKFORD[(n >> (5 * i)) & 31] for i in range(25, -1, -1))
 SIGNAL_TYPE = "fpconv"
 
 
@@ -232,8 +242,12 @@ class VantageBridge:
         tool: str = "intel",
         timeout: int = 20,
         allow_auto_execute: bool = False,
+        chain: str | None = None,
     ):
         self.base = base.rstrip("/")
+        # P1-10: which chain the tape's contracts live on. fomopulse's tape is
+        # Robinhood Chain; FPCONV_CHAIN overrides, an explicit argument wins.
+        self.chain = (chain or os.environ.get("FPCONV_CHAIN", "robinhood")).strip().lower()
         self.tool = tool
         self.tool_key = tool_key
         self.timeout = timeout
@@ -252,7 +266,7 @@ class VantageBridge:
         ceiling = 1.0 if self.allow_auto_execute else self.MAX_PUSH_CONVICTION
         return round((s / 100.0) * ceiling, 4)
 
-    def _body(self, s) -> dict:
+    def _body(self, s, now: int | None = None) -> dict:
         ev = getattr(s, "evidence", {}) or {}
         conv = self.conviction_for(getattr(s, "score", 0.0))
         # Direction: net flow over the window decides it. A convergence with net
@@ -269,6 +283,33 @@ class VantageBridge:
             # can trade this, which is the right default for a research signal.
             "mint": getattr(s, "token", ""),
             "detail": " | ".join((getattr(s, "reasons", None) or [])[:4])[:900],
+            # P1-10: chain alongside today's fields, plus the signal_record/1
+            # fields (Vantage ignores them unless its SIGNAL_RECORD_V1 is on).
+            # The legacy keys above are unchanged.
+            "chain": self.chain,
+            **self._record_fields(s, ev, conv, now),
+        }
+
+    def _record_fields(self, s, ev: dict, conv: float, now: int | None) -> dict:
+        token = getattr(s, "token", "") or ""
+        sym = ((getattr(s, "symbol", "") or token[:12])[:12]) or "?"
+        tape = os.environ.get("FPCONV_TAPE_BASE", "https://fomopulse.app").rstrip("/")
+        ts = int(now or time.time())
+        return {
+            "schema": "signal_record/1",
+            "id": _ulid(ts),
+            "created_at": ts,
+            # The evidence is the tape window this convergence was scored on.
+            "source_ref": f"url:{tape}/api/tape?token={token}",
+            "asset": {"symbol": sym, "chain": self.chain, "address": token},
+            "producer": {"kind": "daemon", "agent_id": None, "version": "fpconv",
+                         "lineage": "fomopulse-tape", "env": os.environ.get("FPCONV_ENV", "contabo-vps"),
+                         "blind": True},
+            # Numeric evidence only: the buyer lists can exceed the record's
+            # 8 KB evidence limit, and the numbers are what gets scored later.
+            "evidence": {k: v for k, v in ev.items()
+                         if isinstance(v, (int, float)) and not isinstance(v, bool)},
+            "tags": ["fomopulse", self.chain],
         }
 
     # ── transport ────────────────────────────────────────────────────────
@@ -347,7 +388,7 @@ class VantageBridge:
         for s in signals[:limit]:
             if not getattr(s, "actionable", False):
                 continue
-            status, body = self._post("/api/intel/signals/ingest", self._body(s))
+            status, body = self._post("/api/intel/signals/ingest", self._body(s, now=now))
             results.append(
                 {
                     "token": getattr(s, "token", ""),

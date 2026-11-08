@@ -388,3 +388,50 @@ def run_all():
 
 if __name__ == "__main__":
     sys.exit(run_all())
+
+
+# ── P1-10: chain field + signal_record/1 alongside today's body ──────────────
+
+class _Sig:
+    token = "0x" + "ab" * 20
+    symbol = "TEST"
+    score = 60.0
+    actionable = True
+    reasons = ["r1"]
+    evidence = {"net_buy_usd": 4200.0, "distinct_buyers": 7, "buyers": ["0x1"] * 400, "flag": True}
+
+
+def test_body_carries_chain_default_robinhood(monkeypatch):
+    from fpconv.bridges import VantageBridge
+    monkeypatch.delenv("FPCONV_CHAIN", raising=False)
+    body = VantageBridge(tool_key="x")._body(_Sig(), now=1_762_632_000)
+    assert body["chain"] == "robinhood" and body["asset"]["chain"] == "robinhood"
+    monkeypatch.setenv("FPCONV_CHAIN", "Base")
+    assert VantageBridge(tool_key="x")._body(_Sig())["chain"] == "base"
+    assert VantageBridge(tool_key="x", chain="ethereum")._body(_Sig())["chain"] == "ethereum"
+
+
+def test_legacy_fields_are_unchanged_and_record_fields_ride_alongside():
+    import json
+    from fpconv.bridges import VantageBridge
+    vb = VantageBridge(tool_key="x")
+    body = vb._body(_Sig(), now=1_762_632_000)
+    # today's fields, same values as before
+    assert body["symbol"] == "TEST" and body["source"] == "fpconv" and body["type"] == "convergence"
+    assert body["mint"] == _Sig.token and body["direction"] == "long"
+    assert body["conviction"] == vb.conviction_for(60.0) <= vb.MAX_PUSH_CONVICTION
+    # the record
+    import re
+    assert body["schema"] == "signal_record/1" and re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{26}", body["id"])
+    assert body["created_at"] == 1_762_632_000
+    assert body["source_ref"].startswith("url:") and _Sig.token in body["source_ref"]
+    assert body["asset"]["address"] == _Sig.token and body["producer"]["lineage"] == "fomopulse-tape"
+    # numeric evidence only (the buyer list could exceed the 8 KB limit)
+    assert body["evidence"] == {"net_buy_usd": 4200.0, "distinct_buyers": 7}
+    assert len(json.dumps(body["evidence"]).encode()) < 8192
+
+
+def test_conviction_cap_stays_069():
+    from fpconv.bridges import VantageBridge
+    assert VantageBridge.MAX_PUSH_CONVICTION == 0.69
+    assert VantageBridge(tool_key="x")._body(_Sig())["conviction"] <= 0.69
